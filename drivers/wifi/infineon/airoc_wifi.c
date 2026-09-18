@@ -141,6 +141,13 @@ const struct airoc_trace *airoc_trace_get(void)
 	return &airoc_trace_ring;
 }
 
+/* radio reset state (see airoc_radio_reset_locked below): the event task sets
+ * the flag on an AP-side deauth/disassoc, disconnect() on every leave,
+ * connect() consumes it
+ */
+static bool airoc_radio_suspect;
+static uint32_t airoc_radio_resets;
+
 #if defined(SPI_DATA_IRQ_SHARED)
 PINCTRL_DT_INST_DEFINE(0);
 #endif
@@ -682,9 +689,6 @@ static bool is_invalid_security(int security, uint8_t psk_length)
  * on request through airoc_wifi_radio_reset() -- for the case the driver
  * cannot see, an association that reports joined while nothing passes.
  */
-static bool airoc_radio_suspect;
-static uint32_t airoc_radio_resets;
-
 static bool airoc_result_is_bus_dead(uint32_t r)
 {
 	return r == WHD_BUFFER_ALLOC_FAIL || r == WHD_TIMEOUT || r == WHD_SEMAPHORE_ERROR ||
