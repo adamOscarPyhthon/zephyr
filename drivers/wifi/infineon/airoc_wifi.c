@@ -14,6 +14,14 @@
 #include <airoc_wifi.h>
 #include <airoc_whd_hal_common.h>
 #include <whd_wlioctl.h>
+/* ATOCO radio reset: the pieces of the WHD shutdown that whd_wifi_off() cannot
+ * reach once the chip has stopped answering (see airoc_wlan_teardown)
+ */
+#include <whd_int.h>
+#include <whd_chip.h>
+#include <whd_thread.h>
+#include <whd_proto.h>
+#include <bus_protocols/whd_bus_sdio_protocol.h>
 
 LOG_MODULE_REGISTER(infineon_airoc_wifi, CONFIG_WIFI_LOG_LEVEL);
 
@@ -99,6 +107,15 @@ enum airoc_trace_kind {
 	AIROC_TRACE_DISCONNECT,    /* a=-ret  b=whd leave result  c=ms taken by leave */
 	AIROC_TRACE_FLAG_CLEARED,  /* a=event_type that cleared is_sta_connected */
 	AIROC_TRACE_RADIO_RESET,   /* a=-ret (0 ok)  b=whd_deinit result  c=ms taken; why in a's high byte */
+	AIROC_TRACE_RESET_STEP,    /* a=step (AIROC_RESET_STEP_*)  b=result  c=ms since the reset began */
+};
+
+enum airoc_reset_step {
+	AIROC_RESET_STEP_OFF = 1,  /* whd_wifi_off(): WLC_DOWN, IRQ off, thread quit, bus deinit */
+	AIROC_RESET_STEP_FORCED,   /* off failed: REG_ON low, IRQ off, OOB off, thread quit, proto detach, state OFF */
+	AIROC_RESET_STEP_DEINIT,   /* whd_bus_sdio_detach() + whd_deinit() */
+	AIROC_RESET_STEP_INIT,     /* airoc_wifi_init_primary(): REG_ON cycle, SDIO, whd_init, attach, wifi_on */
+	AIROC_RESET_STEP_HANDLER,  /* STA link event handler registered again */
 };
 
 /* why a radio reset ran (AIROC_TRACE_RADIO_RESET, a >> 8) */
@@ -695,17 +712,69 @@ static bool airoc_result_is_bus_dead(uint32_t r)
 	       CY_RSLT_GET_MODULE(r) == CY_RSLT_MODULE_ABSTRACTION_OS;
 }
 
+/*
+ * Shut the WLAN down the way Infineon's reference (cybsp_wifi_deinit) does:
+ * whd_wifi_off(), whd_bus_sdio_detach(), whd_deinit(). whd_deinit() refuses to
+ * run (WHD_WLAN_NOTDOWN) unless the state is WLAN_OFF and the bus is detached.
+ *
+ * whd_wifi_off() begins with a WLC_DOWN ioctl and gives up when the chip does
+ * not answer -- the very state this reset is for. Then: REG_ON low so anything
+ * still waiting on the bus fails at once, and by hand the steps whd_wifi_off()
+ * did not reach: SDIO IRQ off, OOB callback off (it points into the driver's
+ * data struct and would be registered twice otherwise), WHD thread quit (only
+ * if whd_wifi_off() did not already quit it), protocol detach, state OFF.
+ * Returns whd_deinit()'s result.
+ */
+static whd_result_t airoc_wlan_teardown(const struct device *dev, uint32_t t0)
+{
+	struct airoc_wifi_data *data = dev->data;
+	whd_driver_t drv = data->whd_drv;
+	whd_result_t r_off, r_deinit;
+
+	if (drv == NULL) {
+		return WHD_SUCCESS;
+	}
+
+	r_off = (airoc_sta_if != NULL) ? whd_wifi_off(airoc_sta_if) : WHD_BADARG;
+	airoc_trace_push(AIROC_TRACE_RESET_STEP, AIROC_RESET_STEP_OFF, r_off,
+			 k_uptime_get_32() - t0);
+
+	if (r_off != WHD_SUCCESS) {
+#if DT_INST_NODE_HAS_PROP(0, wifi_reg_on_gpios)
+		const struct airoc_wifi_config *config = dev->config;
+
+		(void)gpio_pin_set_dt(&config->wifi_reg_on_gpio, 0);
+		k_msleep(WLAN_CBUCK_DISCHARGE_MS);
+#endif
+		if (drv->bus_priv != NULL) {
+			(void)whd_bus_sdio_irq_enable(drv, WHD_FALSE);
+			(void)whd_bus_sdio_unregister_oob_intr(drv);
+		}
+		if (drv->thread_info.thread_quit_flag != WHD_TRUE) {
+			whd_thread_quit(drv);
+		}
+		(void)whd_proto_detach(drv);
+		drv->internal_info.whd_wlan_status.state = WLAN_OFF;
+		airoc_trace_push(AIROC_TRACE_RESET_STEP, AIROC_RESET_STEP_FORCED, 0,
+				 k_uptime_get_32() - t0);
+	}
+
+	whd_bus_sdio_detach(drv);
+	r_deinit = (drv->iflist[0] != NULL) ? whd_deinit(drv->iflist[0]) : WHD_BADARG;
+	airoc_trace_push(AIROC_TRACE_RESET_STEP, AIROC_RESET_STEP_DEINIT, r_deinit,
+			 k_uptime_get_32() - t0);
+	return r_deinit;
+}
+
 /* caller holds data->sema_common */
 static int airoc_radio_reset_locked(const struct device *dev, enum airoc_reset_why why)
 {
 	struct airoc_wifi_data *data = dev->data;
 	uint32_t t0 = k_uptime_get_32();
-	whd_result_t r_deinit = WHD_SUCCESS;
+	whd_result_t r_deinit;
 	int ret;
 
-	if (airoc_sta_if != NULL) {
-		r_deinit = whd_deinit(airoc_sta_if);
-	}
+	r_deinit = airoc_wlan_teardown(dev, t0);
 	airoc_sta_if = NULL;
 	airoc_if = NULL;
 	data->whd_drv = NULL;
@@ -716,11 +785,18 @@ static int airoc_radio_reset_locked(const struct device *dev, enum airoc_reset_w
 
 	ret = airoc_wifi_init_primary(dev, &airoc_sta_if, &airoc_wifi_netif_if_default,
 				      &airoc_wifi_buffer_if_default);
+	airoc_trace_push(AIROC_TRACE_RESET_STEP, AIROC_RESET_STEP_INIT, (uint32_t)(-ret),
+			 k_uptime_get_32() - t0);
 	if (ret == 0) {
+		whd_result_t r_ev;
+
 		airoc_if = airoc_sta_if;
-		if (whd_management_set_event_handler(airoc_sta_if, sta_link_events,
-						     link_events_handler, NULL,
-						     &sta_event_handler_index) != WHD_SUCCESS) {
+		r_ev = whd_management_set_event_handler(airoc_sta_if, sta_link_events,
+							link_events_handler, NULL,
+							&sta_event_handler_index);
+		airoc_trace_push(AIROC_TRACE_RESET_STEP, AIROC_RESET_STEP_HANDLER, r_ev,
+				 k_uptime_get_32() - t0);
+		if (r_ev != WHD_SUCCESS) {
 			LOG_ERR("radio reset: event handler registration failed");
 			ret = -EIO;
 		}
