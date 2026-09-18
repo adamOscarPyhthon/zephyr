@@ -505,6 +505,13 @@ static void airoc_event_task(void)
 		case WLC_E_DEAUTH_IND:
 		case WLC_E_DISASSOC_IND:
 			net_if_dormant_on(airoc_wifi_iface);
+			/* The AP dropped this station. Forget the association here,
+			 * or every later airoc_mgmt_connect() is refused with
+			 * -EALREADY and the interface stays dormant until a reset.
+			 * Upstream clears the flag on these events since the
+			 * wpa_supplicant rework (1daa8ca447).
+			 */
+			airoc_wifi_data.is_sta_connected = false;
 			break;
 
 		default:
