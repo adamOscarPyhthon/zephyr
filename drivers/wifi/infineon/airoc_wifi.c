@@ -98,6 +98,14 @@ enum airoc_trace_kind {
 	AIROC_TRACE_CONNECT_END,   /* a=-ret  b=whd join result  c=ms since CONNECT_BEGIN */
 	AIROC_TRACE_DISCONNECT,    /* a=-ret  b=whd leave result  c=ms taken by leave */
 	AIROC_TRACE_FLAG_CLEARED,  /* a=event_type that cleared is_sta_connected */
+	AIROC_TRACE_RADIO_RESET,   /* a=-ret (0 ok)  b=whd_deinit result  c=ms taken; why in a's high byte */
+};
+
+/* why a radio reset ran (AIROC_TRACE_RADIO_RESET, a >> 8) */
+enum airoc_reset_why {
+	AIROC_RESET_SUSPECT = 1, /* connect() after a leave or an AP-side deauth/disassoc */
+	AIROC_RESET_JOIN_DEAD,   /* join failed inside the bus: RTOS timeout or no buffers */
+	AIROC_RESET_REQUEST,     /* airoc_wifi_radio_reset() called by the application */
 };
 
 struct airoc_trace_rec {
@@ -576,6 +584,7 @@ static void airoc_event_task(void)
 						 (uint16_t)event_header.event_type, 0, 0);
 			}
 			airoc_wifi_data.is_sta_connected = false;
+			airoc_radio_suspect = true;
 			break;
 
 		default:
@@ -655,6 +664,92 @@ static bool is_invalid_security(int security, uint8_t psk_length)
 	return ((security == WIFI_SECURITY_TYPE_NONE) && (psk_length > 0));
 }
 
+/*
+ * Runtime WLAN re-init ("radio reset").
+ *
+ * Measured on Arduino Opta (CYW4343W, WHD 3.3.3, 2026-09-18) with the trace
+ * ring above: the first join after a whd_wifi_leave() completes at L2 (LINK up,
+ * PSK_SUP keyed) but from then on the host cannot talk to the chip -- no DHCP,
+ * ioctls stall, the next leave gets no event, later joins time out and finally
+ * WHD_BUFFER_ALLOC_FAIL for ever. Power save off changes nothing. A cold init
+ * works every time, so that is what this does: whd_deinit(), then the same
+ * airoc_wifi_init_primary() the boot path runs (REG_ON off/on, SDIO, WHD,
+ * firmware download), then the STA event handler again. About two seconds.
+ *
+ * It runs (a) before the next connect() once the association was torn down by
+ * whd_wifi_leave() or by an AP-side DEAUTH/DISASSOC ("suspect"), (b) right
+ * after a join that failed inside the bus (RTOS timeout, no buffers), and (c)
+ * on request through airoc_wifi_radio_reset() -- for the case the driver
+ * cannot see, an association that reports joined while nothing passes.
+ */
+static bool airoc_radio_suspect;
+static uint32_t airoc_radio_resets;
+
+static bool airoc_result_is_bus_dead(uint32_t r)
+{
+	return r == WHD_BUFFER_ALLOC_FAIL || r == WHD_TIMEOUT || r == WHD_SEMAPHORE_ERROR ||
+	       CY_RSLT_GET_MODULE(r) == CY_RSLT_MODULE_ABSTRACTION_OS;
+}
+
+/* caller holds data->sema_common */
+static int airoc_radio_reset_locked(const struct device *dev, enum airoc_reset_why why)
+{
+	struct airoc_wifi_data *data = dev->data;
+	uint32_t t0 = k_uptime_get_32();
+	whd_result_t r_deinit = WHD_SUCCESS;
+	int ret;
+
+	if (airoc_sta_if != NULL) {
+		r_deinit = whd_deinit(airoc_sta_if);
+	}
+	airoc_sta_if = NULL;
+	airoc_if = NULL;
+	data->whd_drv = NULL;
+	data->is_sta_connected = false;
+	sta_event_handler_index = 0xFF;
+	ap_event_handler_index = 0xFF;
+	airoc_radio_suspect = false;
+
+	ret = airoc_wifi_init_primary(dev, &airoc_sta_if, &airoc_wifi_netif_if_default,
+				      &airoc_wifi_buffer_if_default);
+	if (ret == 0) {
+		airoc_if = airoc_sta_if;
+		if (whd_management_set_event_handler(airoc_sta_if, sta_link_events,
+						     link_events_handler, NULL,
+						     &sta_event_handler_index) != WHD_SUCCESS) {
+			LOG_ERR("radio reset: event handler registration failed");
+			ret = -EIO;
+		}
+	} else {
+		LOG_ERR("radio reset: airoc_wifi_init_primary failed %d", ret);
+	}
+	if (data->iface != NULL) {
+		net_if_dormant_on(data->iface);
+	}
+	airoc_radio_resets++;
+	airoc_trace_push(AIROC_TRACE_RADIO_RESET, (uint16_t)(((uint16_t)why << 8) | ((-ret) & 0xFF)),
+			 r_deinit, k_uptime_get_32() - t0);
+	return ret;
+}
+
+int airoc_wifi_radio_reset(const struct device *dev)
+{
+	struct airoc_wifi_data *data = dev->data;
+	int ret;
+
+	if (k_sem_take(&data->sema_common, K_MSEC(AIROC_WIFI_WAIT_SEMA_MS)) != 0) {
+		return -EAGAIN;
+	}
+	ret = airoc_radio_reset_locked(dev, AIROC_RESET_REQUEST);
+	k_sem_give(&data->sema_common);
+	return ret;
+}
+
+uint32_t airoc_wifi_radio_resets(void)
+{
+	return airoc_radio_resets;
+}
+
 static int airoc_mgmt_connect(const struct device *dev, struct wifi_connect_req_params *params)
 {
 	struct airoc_wifi_data *data = (struct airoc_wifi_data *)dev->data;
@@ -684,6 +779,13 @@ static int airoc_mgmt_connect(const struct device *dev, struct wifi_connect_req_
 		LOG_ERR("Network interface is busy AP. Please first disable AP.");
 		ret = -EBUSY;
 		goto error;
+	}
+
+	if (airoc_radio_suspect || airoc_sta_if == NULL) {
+		if (airoc_radio_reset_locked(dev, AIROC_RESET_SUSPECT) != 0) {
+			ret = -EIO;
+			goto error;
+		}
 	}
 
 	usr_result.SSID.length = params->ssid_length;
@@ -726,6 +828,12 @@ static int airoc_mgmt_connect(const struct device *dev, struct wifi_connect_req_
 				 params->psk_length);
 	if (join_res != WHD_SUCCESS) {
 		LOG_ERR("Failed to connect with network");
+		if (airoc_result_is_bus_dead(join_res)) {
+			/* the chip stopped answering: bring it back now, so the
+			 * caller's next attempt starts from a working bus
+			 */
+			(void)airoc_radio_reset_locked(dev, AIROC_RESET_JOIN_DEAD);
+		}
 
 		ret = -EAGAIN;
 		goto error;
@@ -767,6 +875,10 @@ static int airoc_mgmt_disconnect(const struct device *dev)
 		data->is_sta_connected = false;
 		net_if_dormant_on(data->iface);
 	}
+	/* whatever the leave reported, the next join must not run on this
+	 * association's leftovers (see airoc_radio_reset_locked)
+	 */
+	airoc_radio_suspect = true;
 
 	airoc_trace_push(AIROC_TRACE_DISCONNECT, (uint16_t)(-ret), leave_res,
 			 k_uptime_get_32() - t0);
