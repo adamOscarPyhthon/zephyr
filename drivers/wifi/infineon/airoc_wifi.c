@@ -76,6 +76,63 @@ static uint16_t sta_event_handler_index = 0xFF;
 static void airoc_event_task(void);
 static struct airoc_wifi_data airoc_wifi_data = {0};
 
+/*
+ * Trace ring for the association path.
+ *
+ * On the Arduino Opta loader this driver's LOG output never reaches the USB
+ * console, and a statically linked sketch cannot see WHD events at all. Every
+ * event WHD delivers to the STA link handler, every join and every leave is
+ * recorded here with the raw status/reason/flags and its duration; the sketch
+ * reads the ring through airoc_trace_get() (exported by the loader). Writers
+ * are the WHD thread and whoever calls connect()/disconnect(); a slot is
+ * claimed atomically, so records never overwrite each other mid-write, and a
+ * reader that sees seq move while copying simply retries.
+ */
+#define AIROC_TRACE_N 64
+#define AIROC_TRACE_MAGIC 0x41545231 /* 'ATR1' */
+
+enum airoc_trace_kind {
+	AIROC_TRACE_EVENT = 1,     /* a=event_type  b=(status<<16)|reason  c=flags */
+	AIROC_TRACE_CONNECT_BEGIN, /* a=is_sta_connected  b=ssid_length  c=security (zephyr) */
+	AIROC_TRACE_JOIN_BEGIN,    /* a=security (whd, low 16 bits)  b=ssid_length  c=0 */
+	AIROC_TRACE_CONNECT_END,   /* a=-ret  b=whd join result  c=ms since CONNECT_BEGIN */
+	AIROC_TRACE_DISCONNECT,    /* a=-ret  b=whd leave result  c=ms taken by leave */
+	AIROC_TRACE_FLAG_CLEARED,  /* a=event_type that cleared is_sta_connected */
+};
+
+struct airoc_trace_rec {
+	uint32_t ms; /* k_uptime_get_32() when written */
+	uint16_t kind;
+	uint16_t a;
+	uint32_t b;
+	uint32_t c;
+};
+
+struct airoc_trace {
+	uint32_t magic;
+	atomic_t seq; /* records written so far; rec[(seq - 1) % N] is the newest */
+	struct airoc_trace_rec rec[AIROC_TRACE_N];
+};
+
+static struct airoc_trace airoc_trace_ring = {.magic = AIROC_TRACE_MAGIC};
+
+static void airoc_trace_push(uint16_t kind, uint16_t a, uint32_t b, uint32_t c)
+{
+	uint32_t slot = (uint32_t)atomic_inc(&airoc_trace_ring.seq) % AIROC_TRACE_N;
+	struct airoc_trace_rec *r = &airoc_trace_ring.rec[slot];
+
+	r->ms = k_uptime_get_32();
+	r->kind = kind;
+	r->a = a;
+	r->b = b;
+	r->c = c;
+}
+
+const struct airoc_trace *airoc_trace_get(void)
+{
+	return &airoc_trace_ring;
+}
+
 #if defined(SPI_DATA_IRQ_SHARED)
 PINCTRL_DT_INST_DEFINE(0);
 #endif
@@ -487,6 +544,9 @@ static void *link_events_handler(whd_interface_t ifp, const whd_event_header_t *
 	ARG_UNUSED(event_data);
 	ARG_UNUSED(handler_user_data);
 
+	airoc_trace_push(AIROC_TRACE_EVENT, (uint16_t)event_header->event_type,
+			 (event_header->status << 16) | (event_header->reason & 0xFFFF),
+			 event_header->flags);
 	k_msgq_put(&airoc_wifi_msgq, event_header, K_FOREVER);
 	return NULL;
 }
@@ -511,6 +571,10 @@ static void airoc_event_task(void)
 			 * Upstream clears the flag on these events since the
 			 * wpa_supplicant rework (1daa8ca447).
 			 */
+			if (airoc_wifi_data.is_sta_connected) {
+				airoc_trace_push(AIROC_TRACE_FLAG_CLEARED,
+						 (uint16_t)event_header.event_type, 0, 0);
+			}
 			airoc_wifi_data.is_sta_connected = false;
 			break;
 
@@ -599,10 +663,16 @@ static int airoc_mgmt_connect(const struct device *dev, struct wifi_connect_req_
 	whd_scan_result_t usr_result = {0};
 	/* Try to scan ssid to define security */
 	whd_scan_result_t tmp_result = {0};
+	uint32_t join_res = WHD_SUCCESS;
+	uint32_t t0;
 
 	if (k_sem_take(&data->sema_common, K_MSEC(AIROC_WIFI_WAIT_SEMA_MS)) != 0) {
 		return -EAGAIN;
 	}
+
+	t0 = k_uptime_get_32();
+	airoc_trace_push(AIROC_TRACE_CONNECT_BEGIN, data->is_sta_connected, params->ssid_length,
+			 params->security);
 
 	if (data->is_sta_connected) {
 		LOG_ERR("Already connected");
@@ -650,8 +720,11 @@ static int airoc_mgmt_connect(const struct device *dev, struct wifi_connect_req_
 	}
 
 	/* Connect to the network */
-	if (whd_wifi_join(airoc_sta_if, &usr_result.SSID, usr_result.security, params->psk,
-			  params->psk_length) != WHD_SUCCESS) {
+	airoc_trace_push(AIROC_TRACE_JOIN_BEGIN, (uint16_t)usr_result.security,
+			 usr_result.SSID.length, 0);
+	join_res = whd_wifi_join(airoc_sta_if, &usr_result.SSID, usr_result.security, params->psk,
+				 params->psk_length);
+	if (join_res != WHD_SUCCESS) {
 		LOG_ERR("Failed to connect with network");
 
 		ret = -EAGAIN;
@@ -669,6 +742,8 @@ error:
 #endif /* defined(CONFIG_NET_DHCPV4) */
 	}
 
+	airoc_trace_push(AIROC_TRACE_CONNECT_END, (uint16_t)(-ret), join_res,
+			 k_uptime_get_32() - t0);
 	wifi_mgmt_raise_connect_result_event(data->iface, ret);
 	k_sem_give(&data->sema_common);
 	return ret;
@@ -683,13 +758,18 @@ static int airoc_mgmt_disconnect(const struct device *dev)
 		return -EAGAIN;
 	}
 
-	if (whd_wifi_leave(airoc_sta_if) != WHD_SUCCESS) {
+	uint32_t t0 = k_uptime_get_32();
+	uint32_t leave_res = whd_wifi_leave(airoc_sta_if);
+
+	if (leave_res != WHD_SUCCESS) {
 		ret = -EAGAIN;
 	} else {
 		data->is_sta_connected = false;
 		net_if_dormant_on(data->iface);
 	}
 
+	airoc_trace_push(AIROC_TRACE_DISCONNECT, (uint16_t)(-ret), leave_res,
+			 k_uptime_get_32() - t0);
 	wifi_mgmt_raise_disconnect_result_event(data->iface, ret);
 	k_sem_give(&data->sema_common);
 
