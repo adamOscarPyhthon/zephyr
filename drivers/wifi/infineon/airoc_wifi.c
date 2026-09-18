@@ -22,6 +22,9 @@
 #include <whd_thread.h>
 #include <whd_proto.h>
 #include <bus_protocols/whd_bus_sdio_protocol.h>
+/* implemented by airoc_whd_hal_sdio.c in this directory, declared nowhere public */
+whd_result_t whd_bus_sdio_irq_enable(whd_driver_t whd_driver, whd_bool_t enable);
+whd_result_t whd_bus_sdio_unregister_oob_intr(whd_driver_t whd_driver);
 
 LOG_MODULE_REGISTER(infineon_airoc_wifi, CONFIG_WIFI_LOG_LEVEL);
 
